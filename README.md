@@ -70,6 +70,7 @@ Ubuntu/Debian:
 
 ```shell
 sudo apt-get install build-essential pkg-config libgtk-3-dev libappindicator3-dev
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
 Сборка
