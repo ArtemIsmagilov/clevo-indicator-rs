@@ -1,0 +1,23 @@
+[package]
+name = "clevo-indicator-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Ubuntu fan control indicator for Clevo laptops"
+license = "Unlicense"
+readme = "README.md"
+
+[[bin]]
+name = "clevo-indicator-rs"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+gtk = "0.18"
+
+# 0.3 is the last binding release built against gtk 0.18.
+# `original` makes it link against libappindicator3 instead of
+# libayatana-appindicator3.
+appindicator3 = { version = "0.3", default-features = false, features = ["original", "v0_5"] }
+
+[profile.release]
+opt-level = 2
