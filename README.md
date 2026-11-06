@@ -69,18 +69,9 @@ Embedded Controller (EC).
 Ubuntu/Debian:
 
 ```shell
-sudo apt-get install build-essential pkg-config libgtk-3-dev libappindicator3-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt-get install build-essential pkg-config libgtk-3-dev libappindicator3-dev
 ```
-
-Сборка
-------
-
-```shell
-cargo build --release
-```
-
-Бинарник появится в `target/release/clevo-indicator-rs`.
 
 Установка (setuid-root)
 -----------------------
@@ -90,12 +81,8 @@ cargo build --release
 пользователь не имеет доступа к I/O-портам EC.
 
 ```shell
-sudo install -m 4750 -g adm target/release/clevo-indicator-rs /usr/local/bin/
-```
-
-или:
-
-```shell
+git clone https://github.com/ArtemIsmagilov/clevo-indicator-rs.git
+cd clevo-indicator-rs/
 make install
 ```
 
