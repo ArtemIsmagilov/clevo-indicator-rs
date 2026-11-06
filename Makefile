@@ -13,10 +13,8 @@ install: all
 	@sudo install -d -m 755 $(BINDIR)
 	@sudo install -m 4750 -g adm $(TARGET) $(INSTALLED)
 
-test: all
-	@sudo chown root $(TARGET)
-	@sudo chgrp adm $(TARGET)
-	@sudo chmod 4750 $(TARGET)
+test:
+	cargo test
 
 uninstall:
 	@echo "Remove $(INSTALLED)"

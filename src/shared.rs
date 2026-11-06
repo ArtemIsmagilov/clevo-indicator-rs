@@ -1,155 +1,151 @@
 //! Shared state between the UI process and the EC worker process.
 //!
 //! The C version uses a single `mmap(MAP_SHARED | MAP_ANONYMOUS)` block and
-//! `volatile` fields. Here the fields are atomics placed in the same kind of
+//! `volatile` fields. Here the fields are atomics in the same kind of
 //! anonymously shared mapping, which is inherited across `fork(2)`.
+//!
+//! All `unsafe` code is confined to [`Shared::create`]. The resulting
+//! [`Shared`] handle is `Copy`, safe to send between threads and valid until
+//! the process exits.
 
-use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 const SHARED_SIZE: usize = 4096;
 
 #[repr(C)]
-pub struct SharedInfo {
-    pub exit: AtomicI32,
-    pub cpu_temp: AtomicI32,
-    pub gpu_temp: AtomicI32,
-    pub fan_duty: AtomicI32,
-    pub fan_rpms: AtomicI32,
-    pub auto_duty: AtomicI32,
-    pub auto_duty_val: AtomicI32,
-    pub manual_next_fan_duty: AtomicI32,
-    pub manual_prev_fan_duty: AtomicI32,
+struct SharedInfo {
+    exit: AtomicI32,
+    cpu_temp: AtomicI32,
+    gpu_temp: AtomicI32,
+    fan_duty: AtomicI32,
+    fan_rpms: AtomicI32,
+    auto_duty: AtomicI32,
+    auto_duty_val: AtomicI32,
+    manual_next_fan_duty: AtomicI32,
+    manual_prev_fan_duty: AtomicI32,
 }
 
-static SHARE: AtomicPtr<SharedInfo> = AtomicPtr::new(std::ptr::null_mut());
-
-/// Allocates and initializes the shared memory block.
+/// A handle to the shared memory block.
 ///
-/// Must be called once, in the parent process, before `fork(2)`.
-pub fn init() {
-    // SAFETY: an anonymous shared mapping of a plain data structure is used.
-    unsafe {
-        let ptr = libc::mmap(
-            std::ptr::null_mut(),
-            SHARED_SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED,
-            -1,
-            0,
-        );
+/// Must be created in the parent process before `fork(2)`. The child inherits
+/// both the mapping and this handle, so both processes observe the same
+/// atomics.
+#[derive(Clone, Copy)]
+pub struct Shared(&'static SharedInfo);
+
+impl Shared {
+    /// Allocates and initializes the shared memory block.
+    pub fn create() -> std::io::Result<Self> {
+        // SAFETY: an anonymous shared mapping of page-aligned memory is
+        // created. `SharedInfo` contains only atomics, which are valid for any
+        // bit pattern, and the mapping is never unmapped.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                SHARED_SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_SHARED,
+                -1,
+                0,
+            )
+        };
         if ptr == libc::MAP_FAILED {
-            panic!(
-                "unable to allocate shared memory: {}",
-                std::io::Error::last_os_error()
-            );
+            return Err(std::io::Error::last_os_error());
         }
 
-        let info = &*(ptr as *const SharedInfo);
-        SHARE.store(ptr as *mut SharedInfo, Ordering::SeqCst);
+        let info_ptr = ptr as *mut SharedInfo;
 
-        info.exit.store(0, Ordering::SeqCst);
-        info.cpu_temp.store(0, Ordering::SeqCst);
-        info.gpu_temp.store(0, Ordering::SeqCst);
-        info.fan_duty.store(0, Ordering::SeqCst);
-        info.fan_rpms.store(0, Ordering::SeqCst);
-        info.auto_duty.store(1, Ordering::SeqCst);
-        info.auto_duty_val.store(0, Ordering::SeqCst);
-        info.manual_next_fan_duty.store(0, Ordering::SeqCst);
-        info.manual_prev_fan_duty.store(0, Ordering::SeqCst);
+        // SAFETY: `mmap` returned a suitably aligned, exclusively owned block
+        // of at least `size_of::<SharedInfo>()` bytes. Writing a fully
+        // initialized value into it is valid.
+        unsafe {
+            info_ptr.write(SharedInfo {
+                exit: AtomicI32::new(0),
+                cpu_temp: AtomicI32::new(0),
+                gpu_temp: AtomicI32::new(0),
+                fan_duty: AtomicI32::new(0),
+                fan_rpms: AtomicI32::new(0),
+                auto_duty: AtomicI32::new(1),
+                auto_duty_val: AtomicI32::new(0),
+                manual_next_fan_duty: AtomicI32::new(0),
+                manual_prev_fan_duty: AtomicI32::new(0),
+            });
+        }
+
+        // SAFETY: the pointer was just initialized and remains valid for the
+        // rest of the process lifetime.
+        Ok(Self(unsafe { &*info_ptr }))
     }
-}
 
-/// Returns the shared state, panicking if [`init`] has not run.
-///
-/// The returned reference is valid for the rest of the process lifetime
-/// because the mapping is never unmapped.
-pub fn get() -> &'static SharedInfo {
-    try_get().expect("shared memory is not initialized")
-}
-
-/// Returns the shared state if [`init`] has run.
-///
-/// This is used from signal handlers, where panicking is not acceptable.
-pub fn try_get() -> Option<&'static SharedInfo> {
-    let ptr = SHARE.load(Ordering::SeqCst);
-    if ptr.is_null() {
-        None
-    } else {
-        // SAFETY: the pointer is set by `init` and points to a live mapping.
-        Some(unsafe { &*ptr })
-    }
-}
-
-impl SharedInfo {
     pub fn exit(&self) -> i32 {
-        self.exit.load(Ordering::SeqCst)
+        self.0.exit.load(Ordering::SeqCst)
     }
 
     pub fn set_exit(&self, value: i32) {
-        self.exit.store(value, Ordering::SeqCst);
+        self.0.exit.store(value, Ordering::SeqCst);
     }
 
     pub fn cpu_temp(&self) -> i32 {
-        self.cpu_temp.load(Ordering::SeqCst)
+        self.0.cpu_temp.load(Ordering::SeqCst)
     }
 
     pub fn set_cpu_temp(&self, value: i32) {
-        self.cpu_temp.store(value, Ordering::SeqCst);
+        self.0.cpu_temp.store(value, Ordering::SeqCst);
     }
 
     pub fn gpu_temp(&self) -> i32 {
-        self.gpu_temp.load(Ordering::SeqCst)
+        self.0.gpu_temp.load(Ordering::SeqCst)
     }
 
     pub fn set_gpu_temp(&self, value: i32) {
-        self.gpu_temp.store(value, Ordering::SeqCst);
+        self.0.gpu_temp.store(value, Ordering::SeqCst);
     }
 
     pub fn fan_duty(&self) -> i32 {
-        self.fan_duty.load(Ordering::SeqCst)
+        self.0.fan_duty.load(Ordering::SeqCst)
     }
 
     pub fn set_fan_duty(&self, value: i32) {
-        self.fan_duty.store(value, Ordering::SeqCst);
+        self.0.fan_duty.store(value, Ordering::SeqCst);
     }
 
     pub fn fan_rpms(&self) -> i32 {
-        self.fan_rpms.load(Ordering::SeqCst)
+        self.0.fan_rpms.load(Ordering::SeqCst)
     }
 
     pub fn set_fan_rpms(&self, value: i32) {
-        self.fan_rpms.store(value, Ordering::SeqCst);
+        self.0.fan_rpms.store(value, Ordering::SeqCst);
     }
 
     pub fn auto_duty(&self) -> i32 {
-        self.auto_duty.load(Ordering::SeqCst)
+        self.0.auto_duty.load(Ordering::SeqCst)
     }
 
     pub fn set_auto_duty(&self, value: i32) {
-        self.auto_duty.store(value, Ordering::SeqCst);
+        self.0.auto_duty.store(value, Ordering::SeqCst);
     }
 
     pub fn auto_duty_val(&self) -> i32 {
-        self.auto_duty_val.load(Ordering::SeqCst)
+        self.0.auto_duty_val.load(Ordering::SeqCst)
     }
 
     pub fn set_auto_duty_val(&self, value: i32) {
-        self.auto_duty_val.store(value, Ordering::SeqCst);
+        self.0.auto_duty_val.store(value, Ordering::SeqCst);
     }
 
     pub fn manual_next_fan_duty(&self) -> i32 {
-        self.manual_next_fan_duty.load(Ordering::SeqCst)
+        self.0.manual_next_fan_duty.load(Ordering::SeqCst)
     }
 
     pub fn set_manual_next_fan_duty(&self, value: i32) {
-        self.manual_next_fan_duty.store(value, Ordering::SeqCst);
+        self.0.manual_next_fan_duty.store(value, Ordering::SeqCst);
     }
 
     pub fn manual_prev_fan_duty(&self) -> i32 {
-        self.manual_prev_fan_duty.load(Ordering::SeqCst)
+        self.0.manual_prev_fan_duty.load(Ordering::SeqCst)
     }
 
     pub fn set_manual_prev_fan_duty(&self, value: i32) {
-        self.manual_prev_fan_duty.store(value, Ordering::SeqCst);
+        self.0.manual_prev_fan_duty.store(value, Ordering::SeqCst);
     }
 }

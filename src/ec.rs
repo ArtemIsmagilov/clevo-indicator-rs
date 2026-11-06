@@ -1,10 +1,15 @@
 //! Clevo EC (Embedded Controller) low-level access.
 //!
-//! The port I/O code mirrors the original C implementation: the EC is
-//! accessed through command/status port `0x66` and data port `0x62`.
-//! Access must be granted with `ioperm(2)` first, which requires root.
+//! All port I/O and the `ioperm(2)` call are confined to this module. The
+//! public API is safe: creating an [`Ec`] proves that the process has been
+//! granted access to the command/status and data ports, after which the safe
+//! methods can be used freely.
 
 use std::io;
+use std::thread::sleep;
+use std::time::Duration;
+
+use thiserror::Error;
 
 pub const EC_SC: u16 = 0x66;
 pub const EC_DATA: u16 = 0x62;
@@ -12,8 +17,9 @@ pub const EC_DATA: u16 = 0x62;
 const IBF: u32 = 1;
 const OBF: u32 = 0;
 const EC_SC_READ_CMD: u8 = 0x80;
+const WAIT_RETRIES: u32 = 100;
+const WAIT_STEP: Duration = Duration::from_millis(1);
 
-pub const EC_REG_SIZE: usize = 0x100;
 pub const EC_REG_CPU_TEMP: usize = 0x07;
 pub const EC_REG_GPU_TEMP: usize = 0xCD;
 pub const EC_REG_FAN_DUTY: usize = 0xCE;
@@ -28,135 +34,192 @@ pub const MAX_FAN_RPM: f64 = 4400.0;
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 compile_error!("Clevo EC access requires an x86 or x86_64 target");
 
+/// Errors returned while talking to the EC.
+#[derive(Debug, Error)]
+pub enum EcError {
+    /// `ioperm(2)` failed or the EC did not answer in time.
+    #[error("unable to control EC: {0}")]
+    Io(#[from] io::Error),
+
+    /// The EC status register did not reach the expected state.
+    #[error("EC timeout on port {port:#x} (data={data:#x}, flag={flag:#x}, value={value:#x})")]
+    Timeout {
+        port: u16,
+        data: u8,
+        flag: u32,
+        value: u8,
+    },
+
+    /// A duty outside the allowed range was requested.
+    #[error("invalid fan duty {0}, expected 0..=100")]
+    InvalidDuty(i32),
+}
+
+/// A handle to the Clevo Embedded Controller.
+///
+/// The constructor calls `ioperm(2)`; every method is safe because the struct
+/// can only exist after that call succeeded.
+#[derive(Debug)]
+pub struct Ec {
+    _private: (),
+}
+
+impl Ec {
+    /// Grants access to the EC command and data ports.
+    pub fn open() -> Result<Self, EcError> {
+        // SAFETY: `ioperm` only changes the I/O permission bitmap of the
+        // current process. It fails cleanly when the process is not
+        // privileged or the architecture does not support it.
+        unsafe {
+            if libc::ioperm(EC_DATA as libc::c_ulong, 1, 1) != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            if libc::ioperm(EC_SC as libc::c_ulong, 1, 1) != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+        }
+        Ok(Self { _private: () })
+    }
+
+    pub fn cpu_temp(&self) -> Result<i32, EcError> {
+        Ok(self.read_reg(EC_REG_CPU_TEMP)? as i32)
+    }
+
+    pub fn gpu_temp(&self) -> Result<i32, EcError> {
+        Ok(self.read_reg(EC_REG_GPU_TEMP)? as i32)
+    }
+
+    pub fn fan_duty(&self, fan_number: i32) -> Result<i32, EcError> {
+        let reg = if fan_number == 2 {
+            EC_REG_FA2_DUTY
+        } else {
+            EC_REG_FAN_DUTY
+        };
+        Ok(calculate_fan_duty(self.read_reg(reg)? as i32))
+    }
+
+    pub fn fan_rpms(&self) -> Result<i32, EcError> {
+        let hi = self.read_reg(EC_REG_FAN_RPMS_HI)? as i32;
+        let lo = self.read_reg(EC_REG_FAN_RPMS_LO)? as i32;
+        Ok(calculate_fan_rpms(hi, lo))
+    }
+
+    pub fn fa2_rpms(&self) -> Result<i32, EcError> {
+        let hi = self.read_reg(EC_REG_FA2_RPMS_HI)? as i32;
+        let lo = self.read_reg(EC_REG_FA2_RPMS_LO)? as i32;
+        Ok(calculate_fan_rpms(hi, lo))
+    }
+
+    /// Writes the target duty (0..=100 %) for fan 1 or 2.
+    pub fn write_fan_duty(&self, duty_percentage: i32, fan_number: i32) -> Result<(), EcError> {
+        if !(0..=100).contains(&duty_percentage) {
+            return Err(EcError::InvalidDuty(duty_percentage));
+        }
+        let value = (duty_percentage as f64 / 100.0 * 255.0) as u8;
+        self.io_do(0x99, fan_number as u16, value)
+    }
+
+    fn read_reg(&self, reg: usize) -> Result<u8, EcError> {
+        self.io_read(reg as u16)
+    }
+
+    fn io_wait(&self, flag: u32, value: u8) -> Result<(), EcError> {
+        let mut attempt = 0;
+
+        // SAFETY: `Ec` can only be constructed after a successful `ioperm`,
+        // so reading the status port is permitted.
+        unsafe {
+            let mut data = inb(EC_SC);
+
+            while ((data >> flag) & 0x1) != value {
+                if attempt >= WAIT_RETRIES {
+                    return Err(EcError::Timeout {
+                        port: EC_SC,
+                        data,
+                        flag,
+                        value,
+                    });
+                }
+                sleep(WAIT_STEP);
+                data = inb(EC_SC);
+                attempt += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn io_read(&self, port: u16) -> Result<u8, EcError> {
+        self.io_wait(IBF, 0)?;
+
+        // SAFETY: `Ec` guarantees that both ports were granted with
+        // `ioperm(2)`; the command sequence follows the EC protocol.
+        unsafe {
+            outb(EC_SC_READ_CMD, EC_SC);
+
+            self.io_wait(IBF, 0)?;
+            outb(port as u8, EC_DATA);
+
+            self.io_wait(OBF, 1)?;
+            Ok(inb(EC_DATA))
+        }
+    }
+
+    fn io_do(&self, cmd: u8, port: u16, value: u8) -> Result<(), EcError> {
+        self.io_wait(IBF, 0)?;
+
+        // SAFETY: `Ec` guarantees that both ports were granted with
+        // `ioperm(2)`; the command sequence follows the EC protocol.
+        unsafe {
+            outb(cmd, EC_SC);
+
+            self.io_wait(IBF, 0)?;
+            outb(port as u8, EC_DATA);
+
+            self.io_wait(IBF, 0)?;
+            outb(value, EC_DATA);
+        }
+
+        self.io_wait(IBF, 0)
+    }
+}
+
 /// Reads a byte from an I/O port (`inb` from `sys/io.h`).
+///
+/// # Safety
+///
+/// The port must have been granted with `ioperm(2)` in this process.
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
     let value: u8;
-    std::arch::asm!(
-        "in al, dx",
-        in("dx") port,
-        out("al") value,
-        options(nomem, nostack, preserves_flags),
-    );
+    // SAFETY: the caller guarantees that `port` was granted with `ioperm(2)`.
+    unsafe {
+        std::arch::asm!(
+            "in al, dx",
+            in("dx") port,
+            out("al") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
     value
 }
 
 /// Writes a byte to an I/O port (`outb` from `sys/io.h`).
+///
+/// # Safety
+///
+/// The port must have been granted with `ioperm(2)` in this process.
 #[inline]
 unsafe fn outb(value: u8, port: u16) {
-    std::arch::asm!(
-        "out dx, al",
-        in("dx") port,
-        in("al") value,
-        options(nomem, nostack, preserves_flags),
-    );
-}
-
-/// Grants access to the EC command and data ports.
-pub fn init() -> io::Result<()> {
-    // SAFETY: `ioperm` only changes the I/O permission bitmap of the
-    // current process. It is safe to call; failure is reported as an error.
+    // SAFETY: the caller guarantees that `port` was granted with `ioperm(2)`.
     unsafe {
-        if libc::ioperm(EC_DATA as libc::c_ulong, 1, 1) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::ioperm(EC_SC as libc::c_ulong, 1, 1) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn io_wait(port: u16, flag: u32, value: u8) -> bool {
-    // SAFETY: the ports are expected to have been granted by `init`.
-    let mut data = unsafe { inb(port) };
-    let mut i = 0;
-    while ((data >> flag) & 0x1) != value && i < 100 {
-        // SAFETY: plain libc call.
-        unsafe { libc::usleep(1000) };
-        // SAFETY: see above.
-        data = unsafe { inb(port) };
-        i += 1;
-    }
-    if i >= 100 {
-        println!(
-            "wait_ec error on port 0x{port:x}, data=0x{data:x}, flag=0x{flag:x}, value=0x{value:x}"
+        std::arch::asm!(
+            "out dx, al",
+            in("dx") port,
+            in("al") value,
+            options(nomem, nostack, preserves_flags),
         );
-        return false;
     }
-    true
-}
-
-fn io_read(port: u16) -> u8 {
-    io_wait(EC_SC, IBF, 0);
-    // SAFETY: the ports are expected to have been granted by `init`.
-    unsafe { outb(EC_SC_READ_CMD, EC_SC) };
-
-    io_wait(EC_SC, IBF, 0);
-    // SAFETY: see above.
-    unsafe { outb(port as u8, EC_DATA) };
-
-    io_wait(EC_SC, OBF, 1);
-    // SAFETY: see above.
-    unsafe { inb(EC_DATA) }
-}
-
-fn io_do(cmd: u8, port: u16, value: u8) -> bool {
-    io_wait(EC_SC, IBF, 0);
-    // SAFETY: the ports are expected to have been granted by `init`.
-    unsafe { outb(cmd, EC_SC) };
-
-    io_wait(EC_SC, IBF, 0);
-    // SAFETY: see above.
-    unsafe { outb(port as u8, EC_DATA) };
-
-    io_wait(EC_SC, IBF, 0);
-    // SAFETY: see above.
-    unsafe { outb(value, EC_DATA) };
-
-    io_wait(EC_SC, IBF, 0)
-}
-
-pub fn query_cpu_temp() -> i32 {
-    io_read(EC_REG_CPU_TEMP as u16) as i32
-}
-
-pub fn query_gpu_temp() -> i32 {
-    io_read(EC_REG_GPU_TEMP as u16) as i32
-}
-
-pub fn query_fan_duty(fan_number: i32) -> i32 {
-    let reg = if fan_number == 2 {
-        EC_REG_FA2_DUTY
-    } else {
-        EC_REG_FAN_DUTY
-    };
-    calculate_fan_duty(io_read(reg as u16) as i32)
-}
-
-pub fn query_fan_rpms() -> i32 {
-    let hi = io_read(EC_REG_FAN_RPMS_HI as u16) as i32;
-    let lo = io_read(EC_REG_FAN_RPMS_LO as u16) as i32;
-    calculate_fan_rpms(hi, lo)
-}
-
-pub fn query_fa2_rpms() -> i32 {
-    let hi = io_read(EC_REG_FA2_RPMS_HI as u16) as i32;
-    let lo = io_read(EC_REG_FA2_RPMS_LO as u16) as i32;
-    calculate_fan_rpms(hi, lo)
-}
-
-/// Writes the target duty (0..=100 %) for fan 1 or 2.
-///
-/// Returns 0 on success and 1 on failure, like the C version's `EXIT_*`
-/// values.
-pub fn write_fan_duty(duty_percentage: i32, fan_number: i32) -> i32 {
-    if !(0..=100).contains(&duty_percentage) {
-        println!("Wrong fan duty to write: {duty_percentage}");
-        return 1;
-    }
-    let value = (duty_percentage as f64 / 100.0 * 255.0) as u8;
-    io_do(0x99, fan_number as u16, value) as i32
 }
 
 pub fn calculate_fan_duty(raw_duty: i32) -> i32 {
@@ -174,8 +237,9 @@ pub fn calculate_fan_rpms(raw_rpm_high: i32, raw_rpm_low: i32) -> i32 {
 
 /// The aggressive auto fan curve from the original program.
 ///
-/// It keeps temperatures below roughly 60 °C even with Intel Turbo Boost
-/// enabled, and is intentionally more eager than the built-in EC algorithm.
+/// Returns the next duty in percent, or `0` when no change is needed. The
+/// `0` sentinel is part of the original protocol between the curve and the
+/// worker loop.
 pub fn auto_duty_adjust(cpu_temp: i32, gpu_temp: i32, duty: i32) -> i32 {
     let temp = cpu_temp.max(gpu_temp);
 

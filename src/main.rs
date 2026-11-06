@@ -7,22 +7,38 @@
 //!
 //! * the parent process runs as the desktop user and owns the GTK3 /
 //!   libappindicator UI;
-//! * the forked child re-acquires root and talks to the Clevo EC;
+//! * the forked child keeps effective root and talks to the Clevo EC;
 //! * both processes exchange state through a shared anonymous mapping.
 //!
 //! The executable must be installed setuid-root and started by the desktop
 //! user, just like the C version.
+//!
+//! `unsafe` is confined to three small modules:
+//!
+//! * [`ec`] — `ioperm(2)` and the `in`/`out` instructions;
+//! * [`shared`] — the shared `mmap` and the cast to atomics;
+//! * [`process`] — `fork(2)`, which is inherently unsafe in Rust.
+//!
+//! Everything else (menu logic, error handling, signal plumbing, process
+//! supervision, CLI) is safe Rust.
+
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 mod ec;
+mod process;
 mod shared;
+mod signals;
 mod ui;
 mod worker;
 
 use std::env;
 use std::fs;
 use std::io;
-use std::process::{self, ExitCode};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::process::{id, ExitCode};
+
+use nix::unistd::Pid;
+use thiserror::Error;
 
 /// AppIndicator / D-Bus ID for the Rust build. Kept separate from
 /// [`PROC_NAME`] so the indicator identity differs from the C version.
@@ -36,8 +52,21 @@ pub const APP_ID: &str = "clevo-indicator-rs";
 /// the same time and cannot poke the EC concurrently.
 pub const PROC_NAME: &str = "clevo-indicator";
 
-/// PID of the UI parent, observed by the EC worker.
-static PARENT_PID: AtomicI32 = AtomicI32::new(0);
+/// Top-level error type for the binary.
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error(transparent)]
+    Ec(#[from] ec::EcError),
+
+    #[error(transparent)]
+    Io(#[from] io::Error),
+
+    #[error(transparent)]
+    Nix(#[from] nix::Error),
+
+    #[error("GTK initialization failed")]
+    Gtk,
+}
 
 const HELP: &str = "\
 Usage: clevo-indicator-rs [fan-duty-percentage]
@@ -72,19 +101,34 @@ DO NOT MANIPULATE OR QUERY EC I/O PORTS WHILE THIS PROGRAM IS RUNNING.
 ";
 
 fn main() -> ExitCode {
+    init_logging();
     println!("Simple fan control utility for Clevo laptops");
 
-    if check_proc_instances(PROC_NAME) > 1 {
+    match run() {
+        Ok(code) => code,
+        Err(err) => {
+            log::error!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn init_logging() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+}
+
+fn run() -> Result<ExitCode, AppError> {
+    // `check_proc_instances` skips our own PID, so any positive count means
+    // another indicator (C or Rust) is already running. Both builds share the
+    // truncated 15-byte `comm` name, hence they exclude each other.
+    if check_proc_instances(PROC_NAME) > 0 {
         println!("Multiple running instances!");
         if display_available() {
-            ui::show_multiple_instances_dialog();
+            if let Err(err) = ui::show_multiple_instances_dialog() {
+                log::warn!("unable to show the multiple-instances dialog: {err}");
+            }
         }
-        return ExitCode::FAILURE;
-    }
-
-    if let Err(err) = ec::init() {
-        println!("unable to control EC: {err}");
-        return ExitCode::FAILURE;
+        return Ok(ExitCode::FAILURE);
     }
 
     let args: Vec<String> = env::args().collect();
@@ -93,84 +137,74 @@ fn main() -> ExitCode {
         if display_available() {
             run_gui()
         } else {
-            dump_fan()
+            Ok(dump_fan(&ec::Ec::open()?)?)
         }
     } else if args[1].starts_with('-') {
         print!("\n{HELP}");
-        dump_fan()
+        Ok(dump_fan(&ec::Ec::open()?)?)
     } else {
         match args[1].parse::<i32>() {
-            Ok(value) if (0..=100).contains(&value) => test_fan(value),
+            Ok(value) if (0..=100).contains(&value) => Ok(test_fan(&ec::Ec::open()?, value)?),
             Ok(value) => {
                 println!("invalid fan duty {value}!");
-                ExitCode::FAILURE
+                Ok(ExitCode::FAILURE)
             }
             Err(_) => {
                 println!("invalid fan duty {}!", args[1]);
-                ExitCode::FAILURE
+                Ok(ExitCode::FAILURE)
             }
         }
     }
 }
 
 /// Starts the UI process and the EC worker, then waits for the worker.
-fn run_gui() -> ExitCode {
-    // SAFETY: plain libc call.
-    let pid = unsafe { libc::getpid() };
-    PARENT_PID.store(pid, Ordering::SeqCst);
+fn run_gui() -> Result<ExitCode, AppError> {
+    let parent_pid = Pid::this();
+    let shared = shared::Shared::create()?;
 
-    shared::init();
-
-    install_signal(
-        libc::SIGCHLD,
-        main_on_sigchld as *const () as libc::sighandler_t,
-    );
-    signal_term(main_on_sigterm as *const () as libc::sighandler_t);
-
-    // SAFETY: no threads are running at this point, so `fork` is safe.
-    let worker_pid = unsafe { libc::fork() };
-
-    if worker_pid == 0 {
-        // Child: pure EC worker. It must not inherit the parent's SIGCHLD
-        // handler, and a termination signal only asks it to stop at the next
-        // loop iteration (so no EC command is cut in half).
-        install_signal(libc::SIGCHLD, libc::SIG_DFL);
-        signal_term(ec_on_sigterm as *const () as libc::sighandler_t);
-        worker::run();
-        return ExitCode::SUCCESS;
-    }
-
-    if worker_pid > 0 {
-        ui::run();
-        shared::get().set_exit(1);
-        // SAFETY: `worker_pid` is a live child of this process.
-        unsafe {
-            libc::waitpid(worker_pid, std::ptr::null_mut(), 0);
+    match process::fork_worker()? {
+        process::Forked::Child => {
+            // Child: pure EC worker. It opens the EC itself, after the fork,
+            // so the UI process never holds I/O-port permissions. Termination
+            // signals only set a flag, so an in-flight EC command is never
+            // cut in half.
+            worker::run(shared, parent_pid)?;
+            Ok(ExitCode::SUCCESS)
         }
-        return ExitCode::SUCCESS;
+        process::Forked::Parent(worker_pid) => {
+            ui::run(shared, worker_pid)?;
+            shared.set_exit(1);
+
+            match process::wait(worker_pid) {
+                Ok(status) => log::debug!("EC worker status: {status:?}"),
+                Err(nix::errno::Errno::ECHILD) => {
+                    // Already reaped by the UI worker-watch timer.
+                }
+                Err(err) => return Err(err.into()),
+            }
+
+            Ok(ExitCode::SUCCESS)
+        }
     }
-
-    println!("unable to create worker: {}", io::Error::last_os_error());
-    ExitCode::FAILURE
 }
 
-fn dump_fan() -> ExitCode {
+fn dump_fan(ec: &ec::Ec) -> Result<ExitCode, ec::EcError> {
     println!("Dump fan information");
-    println!("  FAN Duty: {}%", ec::query_fan_duty(1));
-    println!("  FA2 Duty: {}%", ec::query_fan_duty(2));
-    println!("  FAN RPMs: {} RPM", ec::query_fan_rpms());
-    println!("  FA2 RPMs: {} RPM", ec::query_fa2_rpms());
-    println!("  CPU Temp: {}°C", ec::query_cpu_temp());
-    println!("  GPU Temp: {}°C", ec::query_gpu_temp());
-    ExitCode::SUCCESS
+    println!("  FAN Duty: {}%", ec.fan_duty(1)?);
+    println!("  FA2 Duty: {}%", ec.fan_duty(2)?);
+    println!("  FAN RPMs: {} RPM", ec.fan_rpms()?);
+    println!("  FA2 RPMs: {} RPM", ec.fa2_rpms()?);
+    println!("  CPU Temp: {}°C", ec.cpu_temp()?);
+    println!("  GPU Temp: {}°C", ec.gpu_temp()?);
+    Ok(ExitCode::SUCCESS)
 }
 
-fn test_fan(duty_percentage: i32) -> ExitCode {
+fn test_fan(ec: &ec::Ec, duty_percentage: i32) -> Result<ExitCode, AppError> {
     println!("Change fans duty to {duty_percentage}%");
-    ec::write_fan_duty(duty_percentage, 1);
-    ec::write_fan_duty(duty_percentage, 2);
+    ec.write_fan_duty(duty_percentage, 1)?;
+    ec.write_fan_duty(duty_percentage, 2)?;
     println!();
-    dump_fan()
+    Ok(dump_fan(ec)?)
 }
 
 fn display_available() -> bool {
@@ -179,56 +213,11 @@ fn display_available() -> bool {
         .unwrap_or(false)
 }
 
-pub fn parent_pid() -> libc::pid_t {
-    PARENT_PID.load(Ordering::SeqCst)
-}
-
-fn install_signal(signal: libc::c_int, handler: libc::sighandler_t) {
-    // SAFETY: `libc::signal` installs a process-wide handler.
-    unsafe {
-        libc::signal(signal, handler);
-    }
-}
-
-fn signal_term(handler: libc::sighandler_t) {
-    install_signal(libc::SIGHUP, handler);
-    install_signal(libc::SIGINT, handler);
-    install_signal(libc::SIGQUIT, handler);
-    install_signal(libc::SIGPIPE, handler);
-    install_signal(libc::SIGALRM, handler);
-    install_signal(libc::SIGTERM, handler);
-    install_signal(libc::SIGUSR1, handler);
-    install_signal(libc::SIGUSR2, handler);
-}
-
-/// Terminates the UI process when the worker exits.
-extern "C" fn main_on_sigchld(_signal: libc::c_int) {
-    // SAFETY: `_exit` is async-signal-safe.
-    unsafe { libc::_exit(0) };
-}
-
-/// UI termination: tell the worker to stop, then exit immediately.
-extern "C" fn main_on_sigterm(_signal: libc::c_int) {
-    if let Some(info) = shared::try_get() {
-        info.set_exit(1);
-    }
-    // SAFETY: `_exit` is async-signal-safe.
-    unsafe { libc::_exit(0) };
-}
-
-/// Worker termination: only set the flag so an in-flight EC command can
-/// finish. The main loop notices it within one poll interval.
-extern "C" fn ec_on_sigterm(_signal: libc::c_int) {
-    if let Some(info) = shared::try_get() {
-        info.set_exit(1);
-    }
-}
-
 /// Counts other running processes with the same `comm` name.
 ///
 /// Returns -1 when `/proc` cannot be read, matching the C implementation.
 fn check_proc_instances(proc_name: &str) -> i32 {
-    let this_pid = process::id();
+    let this_pid = id();
     let dir = match fs::read_dir("/proc") {
         Ok(dir) => dir,
         Err(err) => {
@@ -255,18 +244,47 @@ fn check_proc_instances(proc_name: &str) -> i32 {
             continue;
         };
 
-        let is_same_name = comm.len() >= proc_name.len()
-            && comm.starts_with(proc_name)
-            && comm
-                .as_bytes()
-                .get(proc_name.len())
-                .is_none_or(|&byte| byte == b'\n' || byte == 0);
-
-        if is_same_name {
+        if comm_matches(&comm, proc_name) {
             eprintln!("Process: {pid}");
             instance_count += 1;
         }
     }
 
     instance_count
+}
+
+/// Checks whether a `/proc/<pid>/comm` line names exactly `proc_name`.
+///
+/// The kernel truncates `comm` to 15 bytes, so the Rust binary
+/// (`clevo-indicator-rs`) appears as `clevo-indicator`, exactly like the C
+/// version. A longer name that merely starts with `proc_name` must not match.
+fn comm_matches(comm: &str, proc_name: &str) -> bool {
+    comm.len() >= proc_name.len()
+        && comm.starts_with(proc_name)
+        && comm
+            .as_bytes()
+            .get(proc_name.len())
+            .is_none_or(|&byte| byte == b'\n' || byte == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::comm_matches;
+
+    const NAME: &str = "clevo-indicator";
+
+    #[test]
+    fn matches_kernel_comm_line() {
+        assert!(comm_matches("clevo-indicator\n", NAME));
+        assert!(comm_matches("clevo-indicator\0", NAME));
+        assert!(comm_matches("clevo-indicator", NAME));
+    }
+
+    #[test]
+    fn rejects_longer_names() {
+        assert!(!comm_matches("clevo-indicator-rs\n", NAME));
+        assert!(!comm_matches("clevo-indicator2\n", NAME));
+        assert!(!comm_matches("clevo\n", NAME));
+        assert!(!comm_matches("", NAME));
+    }
 }

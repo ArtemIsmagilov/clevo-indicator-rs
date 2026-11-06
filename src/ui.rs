@@ -4,23 +4,31 @@
 //! indicator whose label shows the CPU temperature and whose icon reflects
 //! the fan RPM, plus a menu for switching between automatic and manual fan
 //! control.
+//!
+//! No `unsafe` is used here: signal handling goes through a self-pipe watched
+//! by GLib and child reaping goes through safe `nix` wrappers.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 use appindicator3::prelude::*;
 use appindicator3::{Indicator, IndicatorCategory, IndicatorStatus};
 use gtk::glib;
 use gtk::prelude::*;
+use nix::unistd::Pid;
 
 use crate::ec;
-use crate::shared;
-use crate::{APP_ID, PROC_NAME};
+use crate::process;
+use crate::shared::Shared;
+use crate::signals;
+use crate::{AppError, APP_ID, PROC_NAME};
 
 /// How often the indicator label and icon are refreshed (the C code used
 /// `g_timeout_add(500, ...)`).
 const UPDATE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often the UI checks whether the worker process is still alive.
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ItemType {
@@ -118,23 +126,27 @@ const MENU: &[MenuEntry] = &[
     },
 ];
 
-/// Runs the indicator main loop. Never returns until the user quits or the
-/// worker process dies.
-pub fn run() {
-    println!("Indicator...");
+/// Runs the indicator main loop until the user quits or the worker dies.
+pub fn run(shared: Shared, worker_pid: Pid) -> Result<(), AppError> {
+    log::info!("starting indicator");
 
     // Drop effective root before creating any GUI objects, exactly like the
     // original: only the desktop user may own an indicator.
-    // SAFETY: plain libc call; `getuid` returns the real (desktop) uid.
-    unsafe { libc::setuid(libc::getuid()) };
+    process::drop_privileges()?;
 
-    if gtk::init().is_err() {
-        eprintln!("unable to initialize GTK");
-        return;
-    }
+    gtk::init().map_err(|_| AppError::Gtk)?;
+
+    // Install the signal pipe and worker watch before doing any UI setup so a
+    // signal arriving during startup is handled instead of the default action.
+    watch_termination(shared)?;
+    watch_worker(shared, worker_pid);
 
     let menu = gtk::Menu::new();
-    let widgets: Rc<RefCell<Vec<gtk::MenuItem>>> = Rc::new(RefCell::new(Vec::new()));
+    // Weak reference used by the menu callbacks. A strong reference would
+    // create a cycle: menu -> item -> closure -> menu. It would be bounded by
+    // the process lifetime, but a weak reference lets the widgets be freed
+    // when the indicator is destroyed.
+    let menu_weak = menu.downgrade();
 
     for entry in MENU {
         let item = if entry.label.is_empty() {
@@ -144,54 +156,56 @@ pub fn run() {
         };
 
         if !entry.label.is_empty() {
-            let widgets = Rc::clone(&widgets);
+            let menu_weak = menu_weak.clone();
             let option = entry.option;
             let action = entry.action;
             item.connect_activate(move |_| match action {
                 Action::SetFan => {
-                    set_fan(option);
-                    toggle_menuitems(&widgets.borrow(), option);
+                    set_fan(shared, option);
+                    if let Some(menu) = menu_weak.upgrade() {
+                        toggle_menuitems(&menu, option);
+                    }
                 }
                 Action::Quit => {
-                    println!("clicked on quit");
+                    log::info!("clicked on quit");
                     gtk::main_quit();
                 }
             });
         }
 
         menu.append(&item);
-        widgets.borrow_mut().push(item);
     }
     menu.show_all();
 
     let indicator = Indicator::new(APP_ID, "brasero", IndicatorCategory::Hardware);
     indicator.set_label("Init..", "XX");
     indicator.set_status(IndicatorStatus::Attention);
-    // The C code passes -2 (gint); the binding exposes it as guint.
+    // The C code passes -2 (gint32); the binding exposes it as guint32.
     indicator.set_ordering_index((-2i32) as u32);
     indicator.set_title(Some("Clevo"));
     indicator.set_menu(Some(&menu));
 
     let update_indicator = indicator.clone();
+    let mut last_temp = i32::MIN;
+    let mut last_icon = i32::MIN;
     glib::timeout_add_local(UPDATE_INTERVAL, move || {
-        update(&update_indicator);
+        update(&update_indicator, shared, &mut last_temp, &mut last_icon);
         glib::ControlFlow::Continue
     });
 
-    toggle_menuitems(&widgets.borrow(), shared::get().fan_duty());
+    toggle_menuitems(&menu, shared.fan_duty());
 
     gtk::main();
-    println!("main on UI quit");
+
+    log::info!("UI quit");
+    Ok(())
 }
 
 /// Shows the "multiple instances" error dialog, if a desktop is available.
-pub fn show_multiple_instances_dialog() {
-    // SAFETY: plain libc call; drop effective root before GTK starts.
-    unsafe { libc::setuid(libc::getuid()) };
-
-    if gtk::init().is_err() {
-        return;
-    }
+pub fn show_multiple_instances_dialog() -> Result<(), AppError> {
+    // SAFETY is encapsulated in `process`: this only calls `setuid`.
+    process::drop_privileges()?;
+    gtk::init().map_err(|_| AppError::Gtk)?;
 
     let dialog = gtk::MessageDialog::new(
         None::<&gtk::Window>,
@@ -202,36 +216,91 @@ pub fn show_multiple_instances_dialog() {
     );
     dialog.run();
     dialog.close();
+    Ok(())
 }
 
-fn update(indicator: &Indicator) {
-    let info = shared::get();
+/// Quits the indicator when a termination signal arrives.
+///
+/// `signal-hook` writes one byte into a self-pipe from each signal handler;
+/// GLib watches the read end. This is fully event-driven: no periodic polling
+/// and no signal-handler code touching GTK or shared state.
+fn watch_termination(shared: Shared) -> Result<(), AppError> {
+    let read_fd = signals::install_signal_pipe()?;
 
-    let label = format!("{}℃", info.cpu_temp());
-    indicator.set_label(&label, "XXXXXX");
+    glib::unix_fd_add_local(read_fd.as_raw_fd(), glib::IOCondition::IN, move |_, _| {
+        let mut buf = [0u8; 16];
+        let _ = nix::unistd::read(&read_fd, &mut buf);
 
-    let load = info.fan_rpms() as f64 / ec::MAX_FAN_RPM * 100.0;
-    let load_rounded = (load / 5.0).round() * 5.0;
-    indicator.set_icon(&format!("brasero-disc-{:02}", load_rounded as i32));
+        log::info!("termination signal received, quitting");
+        shared.set_exit(1);
+        gtk::main_quit();
+        glib::ControlFlow::Break
+    });
+
+    Ok(())
 }
 
-fn set_fan(fan_duty: i32) {
-    let info = shared::get();
-    if fan_duty == 0 {
-        println!("clicked on fan duty auto");
-        info.set_auto_duty(1);
-        info.set_auto_duty_val(0);
-        info.set_manual_next_fan_duty(0);
-    } else {
-        println!("clicked on fan duty: {fan_duty}");
-        info.set_auto_duty(0);
-        info.set_auto_duty_val(0);
-        info.set_manual_next_fan_duty(fan_duty);
+/// Quits the indicator if the EC worker exits or gets reaped unexpectedly.
+fn watch_worker(shared: Shared, worker_pid: Pid) {
+    glib::timeout_add_local(WORKER_POLL_INTERVAL, move || {
+        match process::reap(worker_pid) {
+            Ok(Some(status)) => {
+                log::info!("EC worker exited: {status:?}");
+                shared.set_exit(1);
+                gtk::main_quit();
+                glib::ControlFlow::Break
+            }
+            Ok(None) => glib::ControlFlow::Continue,
+            Err(err) => {
+                log::error!("waitpid failed: {err}");
+                shared.set_exit(1);
+                gtk::main_quit();
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+/// Refreshes the indicator, but only touches GTK/D-Bus when a value changed.
+///
+/// Updating the label and icon unconditionally every 500 ms generates D-Bus
+/// property traffic even when nothing changed; caching the last values keeps
+/// the idle process quiet.
+fn update(indicator: &Indicator, shared: Shared, last_temp: &mut i32, last_icon: &mut i32) {
+    let cpu_temp = shared.cpu_temp();
+    if cpu_temp != *last_temp {
+        indicator.set_label(&format!("{cpu_temp}℃"), "XXXXXX");
+        *last_temp = cpu_temp;
+    }
+
+    let load = shared.fan_rpms() as f64 / ec::MAX_FAN_RPM * 100.0;
+    // Clamp so a spurious EC reading cannot produce a nonexistent icon name.
+    let load_rounded = ((load / 5.0).round() * 5.0).clamp(0.0, 100.0) as i32;
+    if load_rounded != *last_icon {
+        indicator.set_icon(&format!("brasero-disc-{load_rounded:02}"));
+        *last_icon = load_rounded;
     }
 }
 
-fn toggle_menuitems(items: &[gtk::MenuItem], fan_duty: i32) {
-    for (item, entry) in items.iter().zip(MENU.iter()) {
+fn set_fan(shared: Shared, fan_duty: i32) {
+    if fan_duty == 0 {
+        log::info!("clicked on fan duty auto");
+        shared.set_auto_duty(1);
+        shared.set_auto_duty_val(0);
+        shared.set_manual_next_fan_duty(0);
+    } else {
+        log::info!("clicked on fan duty: {fan_duty}");
+        shared.set_auto_duty(0);
+        shared.set_auto_duty_val(0);
+        shared.set_manual_next_fan_duty(fan_duty);
+    }
+}
+
+fn toggle_menuitems(menu: &gtk::Menu, fan_duty: i32) {
+    for (child, entry) in menu.children().iter().zip(MENU.iter()) {
+        let Some(item) = child.downcast_ref::<gtk::MenuItem>() else {
+            continue;
+        };
         let sensitive = if fan_duty == 0 {
             entry.item_type != ItemType::Auto
         } else {
